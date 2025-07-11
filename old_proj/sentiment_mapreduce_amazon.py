@@ -1,0 +1,76 @@
+import pandas as pd
+from textblob import TextBlob
+from multiprocessing import Pool, cpu_count, set_start_method
+from collections import defaultdict
+from tqdm import tqdm
+import boto3
+import time
+
+try:
+    set_start_method("fork")
+except RuntimeError:
+    pass
+
+bucket_name = "scalable-youtube-comments-bucket-personal"
+output_key = "amazon_sentiment_output_mapreduce.txt"
+file_path = "/home/ec2-user/amazon_book_review_filename/Books_rating.csv"
+
+def upload_to_s3(content):
+    s3 = boto3.client("s3")
+    s3.put_object(Bucket=bucket_name, Key=output_key, Body=content.encode("utf-8"))
+
+def chunkify(data, n):
+    size = len(data) // n
+    return [data[i * size: (i + 1) * size] for i in range(n)]
+
+def process_chunk(chunk):
+    stats = {"pos": 0, "neg": 0, "neu": 0, "sum": 0.0, "count": 0}
+    for text in chunk:
+        polarity = TextBlob(str(text)).sentiment.polarity
+        stats["sum"] += polarity
+        stats["count"] += 1
+        if polarity > 0:
+            stats["pos"] += 1
+        elif polarity < 0:
+            stats["neg"] += 1
+        else:
+            stats["neu"] += 1
+    return stats
+
+def reduce_results(results):
+    final = defaultdict(int)
+    final["sum"] = 0.0
+    for r in results:
+        for k in r:
+            final[k] += r[k]
+    return final
+
+def main():
+    start = time.time()
+    df = pd.read_csv(file_path, usecols=["review/text"])
+    reviews = df["review/text"].dropna().tolist()
+
+    num_cores = cpu_count()
+    chunks = chunkify(reviews, num_cores)
+
+    with Pool(num_cores) as pool:
+        results = list(tqdm(pool.imap(process_chunk, chunks), total=num_cores, desc="MapReduce"))
+
+    combined = reduce_results(results)
+    avg_score = combined["sum"] / combined["count"]
+
+    summary = (
+        f"Average Sentiment Score: {avg_score:.4f}\n"
+        f"Positive Reviews: {combined['pos']}\n"
+        f"Negative Reviews: {combined['neg']}\n"
+        f"Neutral Reviews: {combined['neu']}\n"
+        f"Total Reviews: {combined['count']}\n"
+        f"Time Taken: {round(time.time() - start, 2)} seconds\n"
+    )
+
+    print(summary)
+    upload_to_s3(summary)
+
+if __name__ == "__main__":
+    main()
+
